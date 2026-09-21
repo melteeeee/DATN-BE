@@ -115,15 +115,16 @@ def split_video_by_topics(video_path: str, topics: list, output_dir: str = None)
         
         try:
             # Dùng ffmpeg để cắt video
+            # -ss TRƯỚC -i: seek trực tiếp → nhanh hơn, tránh audio missing
             cmd = [
                 "ffmpeg",
-                "-i", video_path,
                 "-ss", str(start_sec),
+                "-i", video_path,
                 "-t", str(duration),
                 "-c", "copy",  # Copy codec không encode lại
                 "-avoid_negative_ts", "make_zero",
+                "-y",  # Ghi đè nếu tồn tại
                 output_path,
-                "-y"  # Ghi đè nếu tồn tại
             ]
             
             result = subprocess.run(
