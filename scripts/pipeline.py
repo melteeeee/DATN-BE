@@ -2,7 +2,8 @@ import os
 os.environ["PATH"] = "/opt/homebrew/bin:" + os.environ.get("PATH", "")
 
 import math
-import time
+import tempfile
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 import instructor
@@ -13,6 +14,7 @@ from pydub import AudioSegment
 from scripts.schemas import TopicChunkLst
 from scripts.video_converter import (
     convert_video_to_ready_wav_pydub,
+    parse_time_to_seconds,
     split_video_by_topics,
 )
 
@@ -29,20 +31,77 @@ def format_time(seconds: float) -> str:
     return f"{m:02d}:{s:02d}"
 
 
+def _transcribe_chunk(args: tuple) -> tuple:
+    """
+    Transcribe mot chunk duy nhat (worker function cho ThreadPoolExecutor).
+    Tra ve (chunk_index, list_of_segments).
+    """
+    i, chunk_audio, chunk_offset_sec, model, api_key = args
+
+    # Tạo temp file unique de tranh conflict
+    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+        temp_path = tmp.name
+
+    try:
+        # Export chunk vao temp file
+        chunk_audio.export(temp_path, format="wav", parameters=["-acodec", "pcm_s16le"])
+
+        # Tao client moi cho moi thread (thread-safe)
+        client = OpenAI(
+            base_url="https://openrouter.ai/api/v1",
+            api_key=api_key,
+        )
+
+        with open(temp_path, "rb") as audio_file:
+            transcription = client.audio.transcriptions.create(
+                model=model,
+                file=audio_file,
+                language="vi",
+                response_format="verbose_json",
+                timestamp_granularities=["segment"],
+            )
+
+        segments = []
+        if hasattr(transcription, "segments") and transcription.segments:
+            for seg in transcription.segments:
+                segments.append({
+                    "start": seg.start + chunk_offset_sec,
+                    "end": seg.end + chunk_offset_sec,
+                    "text": seg.text.strip(),
+                })
+        else:
+            # Fallback: neu API khong tra ve segments
+            chunk_end_sec = chunk_offset_sec + len(chunk_audio) / 1000
+            segments.append({
+                "start": chunk_offset_sec,
+                "end": chunk_end_sec,
+                "text": transcription.text.strip(),
+            })
+
+        print(f"  Doan {i + 1}: OK ({len(segments)} segments)")
+        return i, segments
+
+    except Exception as e:
+        print(f"  Doan {i + 1}: LOI - {e}")
+        return i, []
+    finally:
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
+
+
 def transcribe_long_audio(
     input_wav_path: str,
     chunk_minutes: int = 10,
     model: str = "qwen/qwen3-asr-1.7b",
+    max_workers: int = 5,
 ) -> list:
     """
     Cat audio thanh cac doan nho, gui len API de nhan dien va ghop ket qua.
     Ap dung co che Overlap de chong mat chu o ranh gioi cat.
+    Chay da luong voi ThreadPoolExecutor de tang toc.
     Tra ve danh sach segments voi thoi gian.
     """
-    client = OpenAI(
-        base_url="https://openrouter.ai/api/v1",
-        api_key=os.getenv("OPENROUTER_API_KEY"),
-    )
+    api_key = os.getenv("OPENROUTER_API_KEY")
 
     print(f"Dang tai file {input_wav_path}...")
     audio = AudioSegment.from_wav(input_wav_path)
@@ -54,56 +113,57 @@ def transcribe_long_audio(
 
     print(f"Tong thoi luong: {total_length_ms / 1000 / 60:.2f} phut.")
     print(f"Se chia thanh {total_chunks} doan de xu ly.")
+    print(f"Chay da luong voi {max_workers} workers...")
 
-    all_segments = []
-
+    # Prepare chunk args
+    chunk_args = []
     for i in range(total_chunks):
         start_ms = i * chunk_length_ms
         end_ms = min(total_length_ms, (i + 1) * chunk_length_ms + overlap_ms)
         chunk_offset_sec = start_ms / 1000
+        chunk_audio = audio[start_ms:end_ms]
+        chunk_args.append((i, chunk_audio, chunk_offset_sec, model, api_key))
 
-        print(f"  Doan {i + 1}/{total_chunks} ({start_ms/1000:.0f}s - {end_ms/1000:.0f}s)... ", end="", flush=True)
+    # Chay da luong
+    results = {}
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_to_idx = {
+            executor.submit(_transcribe_chunk, args): args[0]
+            for args in chunk_args
+        }
 
-        chunk = audio[start_ms:end_ms]
-        temp_chunk_path = f"temp_chunk_{i}.wav"
-        chunk.export(temp_chunk_path, format="wav", parameters=["-acodec", "pcm_s16le"])
+        for future in as_completed(future_to_idx):
+            idx, segments = future.result()
+            results[idx] = segments
 
-        try:
-            with open(temp_chunk_path, "rb") as audio_file:
-                transcription = client.audio.transcriptions.create(
-                    model=model,
-                    file=audio_file,
-                    language="vi",
-                    response_format="verbose_json",
-                    timestamp_granularities=["segment"],
-                )
-
-            if hasattr(transcription, "segments") and transcription.segments:
-                for seg in transcription.segments:
-                    all_segments.append({
-                        "start": seg.start + chunk_offset_sec,
-                        "end": seg.end + chunk_offset_sec,
-                        "text": seg.text.strip(),
-                    })
-            else:
-                all_segments.append({
-                    "start": chunk_offset_sec,
-                    "end": end_ms / 1000,
-                    "text": transcription.text.strip(),
-                })
-            print("OK")
-        except Exception as e:
-            print(f"LOI: {e}")
-        finally:
-            if os.path.exists(temp_chunk_path):
-                os.remove(temp_chunk_path)
-
-        if i < total_chunks - 1:
-            time.sleep(1)
+    # Merge results theo thu tu chunk
+    all_segments = []
+    for i in range(total_chunks):
+        all_segments.extend(results.get(i, []))
 
     total_chars = sum(len(s["text"]) for s in all_segments)
     print(f"\nHoan thanh! Tong so ky tu: {total_chars}, so segment: {len(all_segments)}")
     return all_segments
+
+
+def attach_sub_text(segments: list, topic_chunks: TopicChunkLst) -> TopicChunkLst:
+    """
+    Gan sub_text cho moi topic tu segments goc.
+    sub_text = toan bo text cac segments co thoi gian nam trong [start_time, end_time] cua topic.
+    """
+    for topic in topic_chunks.topics:
+        start_sec = parse_time_to_seconds(topic.start_time)
+        end_sec = parse_time_to_seconds(topic.end_time)
+
+        # Loc segments nam trong khoang thoi gian topic (overlap check)
+        matched = [
+            s["text"] for s in segments
+            if s["end"] > start_sec and s["start"] < end_sec
+        ]
+
+        topic.sub_text = " ".join(matched)
+
+    return topic_chunks
 
 
 def extract_topics(
@@ -186,6 +246,13 @@ def process_video(
     print("STEP 3: Phan tach chu de voi LLM")
     print("=" * 50)
     topic_chunks = extract_topics(segments, topic_model)
+
+    # Step 3.5: Attach sub_text cho moi topic
+    print("\n" + "=" * 50)
+    print("STEP 3.5: Gan sub_text cho tung chu de")
+    print("=" * 50)
+    topic_chunks = attach_sub_text(segments, topic_chunks)
+    print(f"Da gan sub_text cho {len(topic_chunks.topics)} chu de.")
 
     # Hien thi ket qua
     print("\n" + "=" * 50)
